@@ -1,0 +1,345 @@
+---
+title: "18-shiny-twitter-reactivity"
+author: "Bastola"
+date: "`r format(Sys.Date(), ' %B %d %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      
+                      collapse = TRUE, 
+                      comment = NA, 
+                      prompt = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE,
+                      fig.height = 3, 
+                      fig.width = 4,
+                      out.width = "100%"
+                      )
+library(tidyverse)
+library(rtweet)
+library(glue)
+library(stringr)
+library(httpuv)
+library(purrr)
+library(shiny)
+library(tidytext)
+library(shinycustomloader)
+library(ggthemes)
+
+```
+
+
+```{r}
+library(shiny)
+library(httr)
+library(rtweet)
+
+# Back-up
+tweets <- read.csv("https://raw.githubusercontent.com/deepbas/statdatasets/main/TrumpTweetData.csv")
+
+```
+
+
+```{r}
+num_tweets_to_download <- 20
+hashtag_to_search <- "Hillary"
+
+tweet_df <- search_tweets(hashtag_to_search, n = num_tweets_to_download, include_rts = FALSE)
+
+
+tweets_twitterdata = tweets %>%
+  select(screenName, text)
+```
+
+
+```{r}
+# remove html elements and unwanted characters
+replace_reg <- "https?://[^\\s]+|&amp;|&lt;|&gt;|\bRT\\b"
+
+# separate into words
+words <- tweets_twitterdata %>% 
+  mutate(text = str_replace_all(text, replace_reg, "")) %>%
+  unnest_tokens(word, text, token = "words") %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(str_detect(word, "[a-z]"))
+```
+
+
+
+```{r}
+# Plot of top 10 words
+words %>% count(word, sort=TRUE) %>%
+  top_n(10) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = word, y = n)) +
+  geom_col(fill ="#773232") +
+  xlab(NULL) +
+  coord_flip() +
+  theme_tufte() +
+  labs(x = "Frequency",
+       y = "Common Words",
+       title = "Top 10 Used Words in #Biden Tweets")
+```
+
+
+```{r}
+# Get sentiments
+sentiments <- words %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>% 
+  mutate(
+      score = case_when(
+        sentiment == 'negative'~n*(-1),
+        sentiment == 'positive'~n*1)
+      ) 
+```
+
+```{r}
+# Calculate total sentiment score
+sentiment_score <- case_when(
+    nrow(sentiments)==0~0, #if no words then score is 0
+    nrow(sentiments)>0~sum(sentiments$score) #sum the pos and neg
+  )
+```
+
+
+```{r}
+#keep track of tweets with no words
+zero_type <- case_when(
+    nrow(sentiments)==0~"NoZero", #no words at all
+    nrow(sentiments)>0~"Zero" #sum of words is 0
+  )
+```
+
+
+```{r}
+# Function to take in tweet and return clean words with sentiment scores
+sentiment_bing <- function(tweet){
+  tweet_tbl <- tibble(text = tweet) %>%
+  mutate(text = str_replace_all(text, replace_reg, "")) %>%
+  unnest_tokens(word, text, token = "words") %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  mutate(score = case_when(
+        sentiment == 'negative'~n*(-1),
+        sentiment == 'positive'~n*1))
+  
+  sentiment_score = case_when(
+    nrow(tweet_tbl)==0~0, 
+    nrow(tweet_tbl)>0~sum(tweet_tbl$score) 
+  )
+  
+  zero_type = case_when(
+    nrow(tweet_tbl)==0~"Zero", 
+    nrow(tweet_tbl)>0~"NoZero" 
+  )
+list(score = sentiment_score, type = zero_type, tweet_tbl = tweet_tbl)
+}
+  
+
+twitterdata_sent = lapply(tweets_twitterdata$text[1:5], function(x) sentiment_bing(x))
+
+twitter_sentiment = bind_rows(
+  tibble(
+    name = hashtag_to_search,
+    score = unlist(purrr::map(twitterdata_sent, 'score')),
+    type = unlist(purrr::map(twitterdata_sent, 'type'))
+  )
+)
+
+data_to_plot <- twitter_sentiment %>% filter(type == "NoZero") %>% select(name, score)
+
+
+ggplot(data_to_plot, aes(x=score, fill=..density..)) +
+        geom_histogram(binwidth=1) + 
+        scale_fill_fermenter(type = "div", palette = "Spectral") +
+        theme_tufte() +
+        labs(x = "Sentiment Score",
+           y = "Frequency",
+           title = sprintf("Sentiment Score among %s Tweets", hashtag_to_search))+
+            theme(plot.title = element_text(size = 20, face = "bold"),
+            plot.subtitle = element_text(size = 15, face = "italic"),
+            axis.title.x = element_text(size = 13),
+            axis.title.y = element_text(size = 13)) 
+
+
+
+```
+
+
+```{r}
+# Shiny Implementation
+
+# function to prepare data, given the search hashtag and number of tweets.
+
+gather_data <- function(hashtag, size) {
+    #get tweets
+    twitterdata <- search_tweets(
+        hashtag, n = size, include_rts = FALSE) %>%
+        select(screen_name, text)
+    
+    replace_reg <- "https?://[^\\s]+|&amp;|&lt;|&gt;|\bRT\\b"
+
+    # tidy up data
+    words <- twitterdata %>% 
+    mutate(text = str_replace_all(text, replace_reg, "")) %>%
+    unnest_tokens(word, text, token = "words") %>%
+    anti_join(stop_words, by = "word") %>%
+    filter(str_detect(word, "[a-z]"))
+    
+    return(list(words, twitterdata))
+}
+
+
+# check <- gather_data("#biden", 20)
+
+plot_top10 <- function(hashtag, n) {
+    data <- gather_data(hashtag, n) %>% purrr::pluck(1)
+
+    data %>% count(word, sort=TRUE) %>%
+    top_n(10) %>%
+    mutate(word = reorder(word, n)) %>%
+    ggplot(aes(x = word, y = n)) +
+    geom_col(fill ="#773232") +
+    xlab(NULL) +
+    coord_flip() +
+    theme_tufte() +
+    labs(y = "Frequency",
+       x = "Common Words",
+       title = str_glue("Top 10 words in ", {hashtag}, " Tweets"))+
+    theme(plot.title = element_text(size = 20, face = "bold"),
+            axis.title.x = element_text(size = 13),
+            axis.title.y = element_text(size = 13)) 
+}
+
+# Sentiment Analysis
+
+# Function to take in tweet and return clean words with sentiment scores
+sentiment_bing <- function(tweet){
+  replace_reg <- "https?://[^\\s]+|&amp;|&lt;|&gt;|\bRT\\b"
+
+  tweet_tbl <- tibble(text = tweet) %>%
+  mutate(text = str_replace_all(text, replace_reg, "")) %>%
+  unnest_tokens(word, text, token = "words") %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  mutate(score = case_when(
+        sentiment == 'negative'~n*(-1),
+        sentiment == 'positive'~n*1))
+  
+  sentiment_score = case_when(
+    nrow(tweet_tbl)==0~0, 
+    nrow(tweet_tbl)>0~sum(tweet_tbl$score) 
+  )
+  
+  zero_type = case_when(
+    nrow(tweet_tbl)==0~"Zero", 
+    nrow(tweet_tbl)>0~"NoZero" 
+  )
+list(score = sentiment_score, type = zero_type, tweet_tbl = tweet_tbl)
+}
+
+
+# Sentiment plot function
+
+sentiment_plot <- function(hashtag, n) {
+    word_data <- gather_data(hashtag, n)
+    data <- word_data[[1]]
+    tweet_data <- word_data[[2]]
+  
+    data_sentiment = lapply(tweet_data$text, function(x) sentiment_bing(x))
+
+    twitter_sentiment = bind_rows(
+        tibble(
+            name = hashtag,
+            score = unlist(map(data_sentiment, 'score')),
+            type = unlist(map(data_sentiment, 'type'))
+        )
+    )
+    
+   twitter_sentiment %>% filter(type == "NoZero") %>% select(name, score) %>%
+    ggplot(aes(x=score, fill=..density..)) +
+        geom_histogram(binwidth=1) +
+        scale_fill_fermenter(type = "div", palette = "Spectral") +
+        theme_tufte() +
+        labs(x = "Sentiment Score",
+           y = "Frequency",
+           title = sprintf("Sentiment Score among %s Tweets", hashtag)) +
+            theme(plot.title = element_text(size = 20, face = "bold"),
+            axis.title.x = element_text(size = 13),
+            axis.title.y = element_text(size = 13)) 
+    
+}
+
+```
+
+
+
+```{r}
+# Implementation
+
+ui <- fluidPage(
+      titlePanel(title=h2("Twitter Data Analysis", align="center")),
+      sidebarPanel(
+         textInput("hashtag", "Twitter Search Query: ", value="#datascience"),
+         sliderInput("tss", "How many tweets for Sentiment Analysis?: ", value=20, min=1, max=200),
+         sliderInput("freq", "How many tweets for Frequency Analysis?: ", value=100, min=1, max=1000),
+         actionButton("submit", "Go!")
+      ),
+      mainPanel(tabsetPanel(
+        tabPanel("Sentiment Analysis", withLoader(plotOutput("plotSentiment"), type="image", loader="https://media.giphy.com/media/WiIuC6fAOoXD2/giphy.gif")),
+        tabPanel("Frequency Analysis", withLoader(plotOutput("plotFrequency"), type="image", loader="https://media.giphy.com/media/PWfHC8ogZpWcE/giphy.gif"))
+      ))
+  
+)
+
+server <- function(input, output){
+  query <- eventReactive(input$submit,
+                           {validate(need(input$hashtag != "", "Hashtag must be provided!"))
+                            input$hashtag
+                           })
+  
+  sentiment <- eventReactive(input$submit, input$tss )
+  freq <- eventReactive(input$submit, input$freq)
+    
+  observeEvent(input$submit, {
+        output$plotFrequency<-renderPlot({
+            plot_top10(query()[[1]], freq()[[1]])
+        })
+        
+        output$plotSentiment<-renderPlot({
+            sentiment_plot(query()[[1]], sentiment()[[1]])
+        })
+    })
+    
+    output$plotFreq<-renderPlot({
+        plot_top10("#datascience", 100)
+    })
+    
+    output$plotSent<-renderPlot({
+        sentiment_plot("#datascience", 20)
+    })
+
+
+}
+
+app <- shinyApp(ui = ui, server = server)
+app
+
+```
+
+
+```{r}
+rsconnect::deployApp()
+```
+
+
+
+
+
